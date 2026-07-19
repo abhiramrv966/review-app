@@ -1,0 +1,19 @@
+{
+  "name": "review-screening-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "next": "14.2.15",
+    "pdf-parse": "^1.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

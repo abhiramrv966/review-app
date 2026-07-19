@@ -1,0 +1,12 @@
+node_modules
+.next
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit secrets — never commit real keys
+.streamlit/secrets.toml
