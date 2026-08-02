@@ -113,6 +113,66 @@ class TestNeedsReview(unittest.TestCase):
         self.assertFalse(rc.needs_review(res, 0.7))
 
 
+class TestJsonArray(unittest.TestCase):
+    def test_plain_array(self):
+        arr = rc.parse_json_array('[{"id":"a","decision":"include"}]')
+        self.assertEqual(len(arr), 1)
+        self.assertEqual(arr[0]["id"], "a")
+
+    def test_fenced_array(self):
+        arr = rc.parse_json_array('```json\n[{"id":"x"}]\n```')
+        self.assertEqual(arr[0]["id"], "x")
+
+    def test_wrapped_results_key(self):
+        arr = rc.parse_json_array('{"results": [{"id":"1"},{"id":"2"}]}')
+        self.assertEqual(len(arr), 2)
+
+    def test_garbage(self):
+        self.assertEqual(rc.parse_json_array("nope"), [])
+
+
+class TestCriteria(unittest.TestCase):
+    def test_format(self):
+        block = rc.format_criteria("must be RCT", "no animals")
+        self.assertIn("INCLUSION", block)
+        self.assertIn("must be RCT", block)
+        self.assertIn("EXCLUSION", block)
+        self.assertIn("no animals", block)
+
+    def test_empty(self):
+        block = rc.format_criteria("", "")
+        self.assertIn("none specified", block)
+
+
+class TestDetectColumns(unittest.TestCase):
+    def test_variants(self):
+        cols = rc.detect_citation_columns(["Article Title", "Abstract Note", "Publication Year", "Authors"])
+        self.assertEqual(cols["title"], "Article Title")
+        self.assertEqual(cols["abstract"], "Abstract Note")
+        self.assertEqual(cols["year"], "Publication Year")
+        self.assertEqual(cols["authors"], "Authors")
+
+    def test_missing(self):
+        cols = rc.detect_citation_columns(["foo", "bar"])
+        self.assertIsNone(cols["title"])
+
+
+class TestClassifyApiError(unittest.TestCase):
+    def test_quota(self):
+        self.assertIsInstance(rc.classify_api_error(Exception("429 You exceeded your current quota")),
+                              rc.QuotaError)
+        self.assertIsInstance(rc.classify_api_error(Exception("Resource has been exhausted")),
+                              rc.QuotaError)
+
+    def test_auth(self):
+        self.assertIsInstance(rc.classify_api_error(Exception("403 API key not valid")), rc.AuthError)
+        self.assertIsInstance(rc.classify_api_error(Exception("401 Unauthenticated")), rc.AuthError)
+
+    def test_other_passthrough(self):
+        exc = Exception("some other network blip")
+        self.assertIs(rc.classify_api_error(exc), exc)
+
+
 class TestNormalizeExtraction(unittest.TestCase):
     def test_shape(self):
         fields = rc.parse_schema("age | number |\nsex | text |")

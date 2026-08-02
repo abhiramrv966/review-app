@@ -41,6 +41,24 @@ DEFAULT_CRITERIA = (
     "editorials, commentaries, protocols, and studies without primary data."
 )
 
+# Inclusion and exclusion criteria are kept separate (per stage) to mirror the
+# standard systematic-review workflow.
+DEFAULT_INCLUSION = (
+    "Studies evaluating an intervention or exposure relevant to the review "
+    "question, reporting outcomes in human participants, based on primary data."
+)
+DEFAULT_EXCLUSION = (
+    "Editorials, commentaries, letters, protocols, reviews without primary "
+    "data, animal or in-vitro studies, wrong population, or wrong outcomes."
+)
+
+
+def format_criteria(inclusion: str, exclusion: str) -> str:
+    """Render separate inclusion/exclusion criteria into a prompt block."""
+    inc = (inclusion or "").strip() or "(none specified — use general methodological relevance)"
+    exc = (exclusion or "").strip() or "(none specified)"
+    return f"INCLUSION criteria:\n{inc}\n\nEXCLUSION criteria:\n{exc}"
+
 DEFAULT_SCHEMA_TEXT = """\
 population | text | The study population / participants
 sample_size | number | Total number of participants analysed
@@ -85,6 +103,32 @@ def parse_json(content: str | None) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def parse_json_array(content: str | None) -> list[dict[str, Any]]:
+    """Best-effort extraction of a JSON array of objects from a model response."""
+    if not content:
+        return []
+    trimmed = content.strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", trimmed, re.IGNORECASE)
+    candidate = fenced.group(1) if fenced else trimmed
+
+    for text in (candidate, (re.search(r"\[[\s\S]*\]", candidate) or [None])[0]):
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, list):
+            return [x for x in parsed if isinstance(x, dict)]
+        if isinstance(parsed, dict):
+            # a single object, or {"results": [...]}
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+            return [parsed]
+    return []
 
 
 def normalize_decision(value: Any) -> str:
@@ -205,15 +249,12 @@ def parse_ris(content: str, source: str = "") -> list[Record]:
     return records
 
 
-def parse_citation_csv(content: str, source: str = "") -> list[Record]:
-    """Parse a CSV citation export (PubMed/Scopus/Zotero style headers)."""
-    records: list[Record] = []
-    reader = csv.DictReader(io.StringIO(content))
-    if not reader.fieldnames:
-        return records
+def detect_citation_columns(fieldnames) -> dict[str, str | None]:
+    """Map a CSV's headers (case-insensitive) to our title/abstract/author/year fields.
 
-    # Map likely header names (case-insensitive) to our fields.
-    lower = {h.lower().strip(): h for h in reader.fieldnames}
+    Works for PubMed, Scopus, Web of Science, Zotero, Rayyan and similar exports.
+    """
+    lower = {str(h).lower().strip(): h for h in (fieldnames or []) if h}
 
     def pick(*cands: str) -> str | None:
         for c in cands:
@@ -221,10 +262,24 @@ def parse_citation_csv(content: str, source: str = "") -> list[Record]:
                 return lower[c]
         return None
 
-    title_h = pick("title", "article title", "document title")
-    abstract_h = pick("abstract", "abstract note")
-    author_h = pick("authors", "author", "author full names")
-    year_h = pick("year", "publication year", "pub year")
+    return {
+        "title": pick("title", "article title", "document title", "primary title"),
+        "abstract": pick("abstract", "abstract note", "abstract text"),
+        "authors": pick("authors", "author", "author full names", "author names"),
+        "year": pick("year", "publication year", "pub year", "py"),
+    }
+
+
+def parse_citation_csv(content: str, source: str = "") -> list[Record]:
+    """Parse a CSV citation export (PubMed/Scopus/Zotero style headers)."""
+    records: list[Record] = []
+    reader = csv.DictReader(io.StringIO(content))
+    if not reader.fieldnames:
+        return records
+
+    cols = detect_citation_columns(reader.fieldnames)
+    title_h, abstract_h = cols["title"], cols["abstract"]
+    author_h, year_h = cols["authors"], cols["year"]
 
     for i, row in enumerate(reader, start=1):
         records.append(
@@ -304,7 +359,7 @@ def schema_to_prompt_block(fields: list[SchemaField]) -> str:
 # Prompt builders
 # --------------------------------------------------------------------------- #
 
-def build_ta_prompt(record_text: str, criteria: str) -> str:
+def build_ta_prompt(record_text: str, inclusion: str, exclusion: str) -> str:
     return f"""You are screening a citation for a systematic review at the TITLE/ABSTRACT stage.
 Decide whether it should be INCLUDED for full-text review or EXCLUDED. When the
 abstract is insufficient to decide, prefer "include" (do not exclude on missing
@@ -318,20 +373,37 @@ Return ONLY valid JSON:
 }}
 "confidence" is your certainty in the decision, from 0.0 to 1.0.
 
-Inclusion criteria:
-{criteria or DEFAULT_CRITERIA}
+{format_criteria(inclusion, exclusion)}
 
 Citation:
 {record_text}"""
 
 
-def build_fulltext_prompt(criteria: str, exclusion_reasons: list[str]) -> str:
+def build_ta_batch_prompt(items: list[dict[str, str]], inclusion: str, exclusion: str) -> str:
+    """Screen several citations in one call (fewer API calls -> free-tier friendly)."""
+    payload = json.dumps([{"id": it["id"], "text": it["text"]} for it in items], ensure_ascii=False)
+    return f"""You are screening citations for a systematic review at the TITLE/ABSTRACT stage.
+For EACH item below decide INCLUDE or EXCLUDE for full-text review. When an
+abstract is insufficient to decide, prefer "include".
+
+Return ONLY a JSON array with one object per input item, preserving the same "id":
+[
+  {{"id": "<id>", "decision": "include|exclude|unclear", "reason": "one concise sentence", "confidence": 0.0}}
+]
+
+{format_criteria(inclusion, exclusion)}
+
+Items (JSON array of {{id, text}}):
+{payload}"""
+
+
+def build_fulltext_prompt(inclusion: str, exclusion: str, exclusion_reasons: list[str]) -> str:
     reasons = exclusion_reasons or DEFAULT_EXCLUSION_REASONS
     reason_list = "\n".join(f"- {r}" for r in reasons)
     return f"""You are screening the FULL TEXT of a study for a systematic review.
-Apply the inclusion criteria in detail using the attached PDF. If excluding,
-choose exactly one reason from the allowed list (PRISMA requires a single
-primary reason per excluded study).
+Apply the criteria in detail using the attached PDF. If excluding, choose exactly
+one reason from the allowed list (PRISMA requires a single primary reason per
+excluded study).
 
 Return ONLY valid JSON:
 {{
@@ -341,8 +413,7 @@ Return ONLY valid JSON:
   "confidence": 0.0
 }}
 
-Inclusion criteria:
-{criteria or DEFAULT_CRITERIA}
+{format_criteria(inclusion, exclusion)}
 
 Allowed exclusion reasons:
 {reason_list}"""
@@ -412,6 +483,30 @@ def needs_review(result: dict[str, Any], confidence_threshold: float = 0.7,
 # Gemini client wrapper
 # --------------------------------------------------------------------------- #
 
+class QuotaError(RuntimeError):
+    """Raised when Gemini returns a 429 / quota-exceeded after retries."""
+
+
+class AuthError(RuntimeError):
+    """Raised when the API key is missing, malformed, or rejected (401/403)."""
+
+
+def classify_api_error(exc: Exception) -> Exception:
+    """Map a raw google-generativeai error to a friendly, typed exception."""
+    msg = str(exc)
+    low = msg.lower()
+    if "429" in msg or "quota" in low or "resource" in low or "rate limit" in low:
+        return QuotaError(
+            "Gemini quota/rate limit hit (429). On the free tier this resets daily "
+            "(~midnight Pacific). Lower the batch size, wait, or enable billing.")
+    if any(t in msg for t in ("401", "403")) or "api key" in low or "permission" in low \
+            or "unauthenticated" in low or "invalid" in low:
+        return AuthError(
+            "Gemini rejected the API key. Make sure it is a Google AI Studio key "
+            "(it starts with 'AIza') from https://aistudio.google.com/apikey.")
+    return exc
+
+
 class GeminiClient:
     """Thin wrapper around google-generativeai with JSON-mode responses."""
 
@@ -421,20 +516,52 @@ class GeminiClient:
         self._genai = genai
         self.model = genai.GenerativeModel(model_name)
 
-    def _generate(self, parts: list[Any]) -> str:
-        resp = self.model.generate_content(
-            parts,
-            generation_config={"response_mime_type": "application/json"},
-        )
-        return resp.text or ""
+    def _generate(self, parts: list[Any], max_retries: int = 3) -> str:
+        import time
+        delay = 5.0
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                resp = self.model.generate_content(
+                    parts,
+                    generation_config={"response_mime_type": "application/json"},
+                )
+                return resp.text or ""
+            except Exception as exc:  # noqa: BLE001
+                friendly = classify_api_error(exc)
+                last_exc = friendly
+                # Only transient rate limits are worth retrying with backoff.
+                if isinstance(friendly, QuotaError) and attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise friendly from exc
+        raise last_exc  # pragma: no cover
 
-    def screen_title_abstract(self, record: Record, criteria: str) -> dict[str, Any]:
-        prompt = build_ta_prompt(record.as_text(), criteria)
+    def screen_title_abstract(self, record: Record, inclusion: str, exclusion: str) -> dict[str, Any]:
+        prompt = build_ta_prompt(record.as_text(), inclusion, exclusion)
         return normalize_screen_result(parse_json(self._generate([prompt])))
 
-    def screen_full_text(self, pdf_bytes: bytes, criteria: str,
+    def screen_title_abstract_batch(self, records: list[Record], inclusion: str,
+                                    exclusion: str) -> dict[str, dict[str, Any]]:
+        """Screen a batch of records in one API call; returns {record_id: result}."""
+        items = [{"id": r.id, "text": r.as_text()} for r in records]
+        prompt = build_ta_batch_prompt(items, inclusion, exclusion)
+        arr = parse_json_array(self._generate([prompt]))
+        by_id = {str(o.get("id")): o for o in arr}
+        out: dict[str, dict[str, Any]] = {}
+        for r in records:
+            match = by_id.get(str(r.id))
+            if match is None:
+                out[r.id] = {"decision": "unclear", "reason": "No result returned for this item.",
+                             "exclusionReason": "", "confidence": 0.0}
+            else:
+                out[r.id] = normalize_screen_result(match)
+        return out
+
+    def screen_full_text(self, pdf_bytes: bytes, inclusion: str, exclusion: str,
                          exclusion_reasons: list[str]) -> dict[str, Any]:
-        prompt = build_fulltext_prompt(criteria, exclusion_reasons)
+        prompt = build_fulltext_prompt(inclusion, exclusion, exclusion_reasons)
         parts = [{"mime_type": "application/pdf", "data": pdf_bytes}, prompt]
         return normalize_screen_result(parse_json(self._generate(parts)))
 
